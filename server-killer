@@ -1,0 +1,533 @@
+package main
+//日志模块
+import (
+	"fmt"
+	"os"
+	"path"
+	"path/filepath"
+	"time"
+)
+
+type Logger interface {
+	Info(string)
+	Warn(string)
+	Error(string)
+}
+type OutFile struct {
+	Path string
+}
+
+func (o OutFile)Info(logCon string)  {
+	Prefix:= nowTime("INFO")+" "+logCon
+	logg(Prefix,o.Path)
+}
+func (o OutFile)Warn(logCon string)  {
+	Prefix:= nowTime("Warn")+" "+logCon
+	logg(Prefix,o.Path)
+}
+func (o OutFile)Error(logCon string)  {
+	Prefix:= nowTime("Error")+" "+logCon
+	logg(Prefix,o.Path)
+}
+func nowTime(logLevel string)string{
+	now:=time.Now()
+	return now.Format("2006-01-02 15:04:05.000 ")+logLevel
+}
+func logg(text string,filePa string){
+	ex, _ := os.Executable()
+	workPath := filepath.Dir(ex)
+	now:=time.Now()
+	tim:=fmt.Sprintf(now.Format("2006-01-02-"))
+	filePa=tim+filePa
+	LogFilePath:= path.Join(workPath,filePa)
+	file,err:=os.OpenFile(LogFilePath,os.O_RDWR|os.O_CREATE|os.O_APPEND,0644)
+	if err!=nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	defer file.Close()
+	gText:=fmt.Sprintf("%s\n",text)
+	_,err=file.WriteString(gText)
+	if err != nil{
+		fmt.Println(err)
+		os.Exit(1)
+	}
+}
+package main
+//主函数
+import (
+	"fmt"
+	"net/http"
+	"os"
+)
+
+//Ret 声明一个全局变量
+var Ret *MaHang
+var log Logger = OutFile{Path: "killerServer.log"}
+
+//监控程序
+
+func main() {
+	log.Info("The services of MaFei and ZhangQiHang began to start" +
+		"//\n//                            _ooOoo_\n//                           o8888888o\n//                           88\" . \"88\n//                           (| -_- |)\n//                            O\\ = /O\n//                        ____/`---'\\____\n//                      .   ' \\\\| |// `.\n//                       / \\\\||| 2 |||// \\\n//                     / _||||| -0- |||||- \\\n//                       | | \\\\\\ 2 /// | |\n//                     | \\_| ''\\-1-/'' | |\n//                      \\ .-\\__ `1` ___/-. /\n//                   ___`. .' /--0--\\ `. . __\n//                .\"\" '< `.___\\_<1>_/___.' >'\"\".\n//               | | : `- \\`.;`\\ 8 /`;.`/ - ` : | |\n//                 \\ \\ `-. \\_ __\\ /__ _/ .-` / /\n//         ======`-.____`-.___\\_____/___.-`____.-'======\n//                            `=---='\n//\n//         .............................................\n//                  佛祖保佑                  永无BUG")
+	stopNumber := GetConf().SysParameter.DeathNum
+	stopTime := GetConf().SysParameter.InterValTime
+	stopSerList := GetConf().JavaServerList.SvList
+	log.Info("Yaml format conversion succeeded")
+	localIp:=os.Getenv("LOCAL_IP")
+	Ret = NewMaHang(&stopNumber, &stopTime, &stopSerList,&localIp)
+	go Ret.zkMonitor()
+	go Ret.TimerSer()
+	http.HandleFunc("/stop", Stopped)
+	http.HandleFunc("/start", Started)
+	http.HandleFunc("/see", See)
+	http.HandleFunc("/revise", Revise)
+	http.HandleFunc("/time", TimeDifference)
+	log.Info("The main thread, the http service, starts listening to the interface")
+	err := http.ListenAndServe(*Ret.localIp+":11082", nil)
+	if err != nil {
+		log.Error(fmt.Sprintf("The HTTP service encountered a problem:%v", err))
+	}
+}
+
+package main
+
+import (
+	"fmt"
+	"io/ioutil"
+	"os/exec"
+	"sync"
+	"time"
+)
+
+var lock sync.Mutex
+
+//zhi 这就是个没有感情的执行linux命令方法
+func (m *MaHang) zhi(ming string) (bool, string) {
+	cmd := exec.Command("/bin/bash", "-c", ming)
+	stderr, _ := cmd.StderrPipe()
+	stdout, _ := cmd.StdoutPipe()
+	cmd.Start()
+	bytes, _ := ioutil.ReadAll(stderr)
+	if string(bytes) != "" {
+		return false, string(bytes)
+	} else {
+		bytes, _ := ioutil.ReadAll(stdout)
+		return true, string(bytes)
+	}
+}
+
+//KillServer 要执行的shell命令过度
+func (m *MaHang) KillServer(svPort string) {
+	cmd := fmt.Sprintf("ss -anplt | grep %v | awk '{print $NF}' | awk -F',' '{print $2}'|awk -F'=' '{print $2}' | xargs kill -9 ", svPort)
+	ok, ret := m.zhi(cmd)
+	if ok {
+		log.Info("The deletion command is successfully executed ")
+	} else {
+		log.Error(cmd + "Delete failed,Check whether the interval for stopping the service is too short or the ZK update is delayed. It is better to set the interval to more than 60 seconds" + ret)
+	}
+}
+
+//IsStart 判断服务是否启动，传入服务名字服务端口号以及停止时间
+func (m *MaHang) IsStart(serName string, serPort string, stopTime int64) {
+	end := make(chan bool, 2)
+	var noInZk int64
+	var startProcess int64
+	var InZk int64
+	var wg sync.WaitGroup
+	wg.Add(2)
+	log.Info(serName+"开启监控zk该服务状态的线程")
+	go func() {
+		defer wg.Done()
+	Loop:
+		for true {
+			select {
+			case <-end:
+				log.Info(serName+"进程先启动，取消监测zk中该服务的状态")
+				noInZk = startProcess
+				InZk = startProcess
+				return
+			default:
+				_, ok := m.configServerList[serName]
+				if !ok {
+					log.Info(serName + "已经从zk中退出")
+					noInZk = time.Now().Unix()
+					break Loop
+				}
+			}
+		}
+		for true {
+			_, ok := m.configServerList[serName]
+			if ok {
+				log.Info(serName + "已经重新刷进zk")
+				InZk = time.Now().Unix()
+				break
+			}
+		}
+	}()
+	log.Info(serName+"开启监测进程是否存在的线程")
+	go func() {
+		defer wg.Done()
+		cmd := fmt.Sprintf("ss -anplt | grep %v", serPort)
+		//死循环监控服务是否起来结合linux命令
+		for {
+			ok, ret := m.zhi(cmd)
+			if ret == "" {
+				continue
+			}
+			if ok {
+				startProcess = time.Now().Unix()
+				log.Info(serName + "已启动")
+				end <- true
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	ok:=false
+	var ser Ser
+	var x int
+	for x,ser = range m.startTime{
+		if serName==ser.SerName{
+			log.Info(serName+"!!!!!服务已存在于杀死过的列表里，准备更新")
+			ok=true
+			break
+		}
+	}
+	lock.Lock()
+	if ok {
+		m.startTime[x].ZkOkTime = (m.startTime[x].ZkOkTime + InZk - startProcess) / 2
+		m.startTime[x].KillProcessToZkTime = (m.startTime[x].KillProcessToZkTime + noInZk - stopTime) / 2
+		m.startTime[x].ZkToProcessStartTime = (m.startTime[x].ZkToProcessStartTime + startProcess - noInZk) / 2
+		m.startTime[x].TimSum = (m.startTime[x].TimSum+InZk-stopTime)/2
+		m.startTime[x].Num++
+	} else {
+		m.startTime=append(m.startTime, Ser{SerName:serName,KillProcessToZkTime: noInZk - stopTime, ZkToProcessStartTime: startProcess - noInZk, ZkOkTime: InZk - startProcess,TimSum: InZk-stopTime,Num: 1})
+	}
+	lock.Unlock()
+}
+
+package main
+//创建新的对象
+import "time"
+
+type Ser struct {
+	SerName string
+	KillProcessToZkTime int64
+	ZkToProcessStartTime int64
+	ZkOkTime int64
+	TimSum int64
+	Num int
+}
+// MaHang 声明一个全局类
+type MaHang struct {
+	//stopTime 停服务时间间隔
+	stopTime *int
+	//stopTime 单次停服务个数
+	stopNum *int
+	//当前服务器正常的服务
+	configServerList map[string]string
+	//定时器
+	timerTime *time.Ticker
+	//停线程
+	stop chan bool
+	//状态码
+	ztm bool
+	//配置文件获取的服务列表
+	serverList *[]string
+	//本机ip
+	localIp *string
+	//服务启动用时单位秒
+	startTime []Ser
+	//我这个服务的启动时间
+	start int64
+}
+
+//NewMaHang 构造函数
+func NewMaHang(stopNum *int, stopTime *int ,serverList *[]string,localIp *string) *MaHang {
+	log.Info("Object created successfully")
+
+	return &MaHang{
+		stopNum:          stopNum,
+		stopTime:         stopTime,
+		configServerList: make(map[string]string),
+		timerTime:        time.NewTicker(time.Duration(*stopTime) * time.Second),
+		stop:             make(chan bool),
+		ztm:              true,
+		serverList:       serverList,
+		localIp: localIp,
+		startTime: []Ser{},
+		start: time.Now().Unix(),
+	}
+}
+
+package main
+//接口的设计与实现
+import (
+	"fmt"
+	"net/http"
+	"strconv"
+	"table"
+	"time"
+)
+
+
+//Revise 修改接口
+func Revise(w http.ResponseWriter, req *http.Request) {
+	//获取接口传参
+	log.Info("revise interface is called")
+	query := req.URL.Query()
+	stopTime, ok1 := query["stime"]
+	stopNum, ok2 := query["snum"]
+	if ok1 && ok2 {
+		t := stopTime[0]
+		n := stopNum[0]
+		//转换类型
+		st, err1 := strconv.Atoi(t)
+		sn, err2 := strconv.Atoi(n)
+		if err1==nil && err2==nil {
+			*Ret.stopNum=sn
+			*Ret.stopTime=st
+			Ret.timerTime.Reset(time.Duration(st)*time.Second)
+			val:=fmt.Sprintf("The parameter is modified successfully. The current timer interval is %d seconds, and %d services are closed each time",st,sn)
+			log.Info(val)
+			fmt.Fprintln(w,true)
+		}else {
+			log.Warn("The parameter format is incorrect")
+			fmt.Fprintln(w,false)
+		}
+	} else {
+		log.Warn("Incomplete parameters")
+		fmt.Fprintln(w, false)
+	}
+
+}
+
+//Started 启动接口
+func Started(w http.ResponseWriter, req *http.Request) {
+	log.Info("The startup interface is called")
+	if !Ret.ztm {
+		Ret.timerTime = time.NewTicker(time.Duration(*Ret.stopTime) * time.Second)
+		Ret.ztm = true
+		fmt.Println("开启新的停服务线程,当前状态码为", Ret.ztm)
+		go Ret.TimerSer()
+		log.Info("Stop program service thread started")
+		fmt.Fprintln(w, true)
+	} else {
+		log.Warn("The stop program service thread has started and cannot be started")
+		fmt.Fprintln(w, false)
+	}
+}
+
+//Stopped 停止接口
+func Stopped(w http.ResponseWriter, req *http.Request) {
+	log.Info("The stop interface is called.")
+	if Ret.ztm {
+		Ret.stop <- true
+		Ret.ztm = false
+		log.Info("The stop program service thread exit")
+		fmt.Fprintln(w, true)
+	} else {
+		log.Warn("The stop program service thread was not started and cannot be stopped")
+		fmt.Fprintln(w, false)
+	}
+}
+
+//See 查看接口
+func See(w http.ResponseWriter, req *http.Request) {
+	log.Info("The see interface is called to start execution")
+	fmt.Fprintln(w,"本服务器拥有的服务  ：  端口号")
+	for k,v := range Ret.configServerList{
+		fmt.Fprintf(w,"%s  ：  %s\n",k,v)
+	}
+	fmt.Fprintln(w,len(Ret.configServerList))
+	log.Info("The see interface is success")
+}
+
+func TimeDifference(w http.ResponseWriter, req *http.Request)  {
+	log.Info("The TimeDifference interface is called to start execution")
+	s:=table.Table(Ret.startTime)
+	log.Info("\n"+s)
+	fmt.Fprintf(w,"您已经启动该程序%v秒",time.Now().Unix()-Ret.start)
+	log.Info("The TimeDifference interface is success")
+}
+package main
+//筛选以及判断出可停止的服务端口号
+import (
+	"math/rand"
+	"time"
+)
+
+//In 判断某个字符串在不在一个数组里 [string]string
+func In(target string, strArray []string) bool {
+	for _, element := range strArray{
+		if target == element{
+			return true
+		}
+	}
+	return false
+}
+
+//停服务方法
+func (m *MaHang) stopServer() {
+	log.Info("begin kill")
+	//从配置文件获取每次kill服务个数
+	//获取本机ip注册的服务列表，是map字典
+	localSvList := m.configServerList
+	//获取从配置文件中读到的服务列表，是数组[string]string
+	cnfSvList := m.serverList
+	//获取服务名称的切片
+	var keyLocalSvList []string
+	//获取端口的切片
+	var valueLocalSvList []string
+	//从在线服务中循环遍历出服务名称和端口号分别存储
+	for k,v := range localSvList{
+		keyLocalSvList=append(keyLocalSvList, k)
+		valueLocalSvList=append(valueLocalSvList,v)
+	}
+	//创建一个交集切片
+	intersection:=[]string{""}
+	//遍历在线服务的服务名称列表然后判断是否在配置文件的列表中
+	for _,key := range keyLocalSvList{
+		if In(key,*cnfSvList){
+			intersection=append(intersection,key)
+		}
+	}
+	//这里是判断交集的长度是否小于要停止服务的个数
+	if len(intersection)<*m.stopNum {
+		log.Warn("The length of intersections is less than the number of deletions, which is not enough for deletion. Jump out of this deletion and wait for the next deletion")
+		return
+	}
+	//随机数的必要条件
+	rand.Seed(time.Now().UnixNano())
+	//这里创建一个服务列表用来存储已经删除了的服务防止重删
+	abc:=make(map[string]int)
+	for i := 0 ; i < *m.stopNum; i++{
+		for  {
+			//生成随机数根据交集长度
+			sjs := rand.Intn(len(intersection))
+			//判断服务是否存在已删除的列表里
+			_,ok:=abc[intersection[sjs]]
+			if ok {
+				//存在的话结束本次循环
+				continue
+			}else {
+				//不存在的话将本服务添加进已删除的服务列表
+				abc[intersection[sjs]]=1
+				log.Info("kill server "+intersection[sjs])
+				//将端口号传入杀进程的方法中
+				m.KillServer(localSvList[intersection[sjs]])
+				//记录杀死进程的时间
+				ti:=time.Now().Unix()
+				//调用线程监控该服务什么时候启动
+				go m.IsStart(intersection[sjs],localSvList[intersection[sjs]],ti)
+				break
+			}
+		}
+	}
+}
+package main
+
+
+//TimerSer 定时器程序
+func (m *MaHang) TimerSer() {
+	log.Info("Start timer")
+	defer m.timerTime.Stop()
+	for {
+		select {
+		case <-m.stop:
+			m.ztm = false
+			log.Warn("The timer thread is about to close")
+			return
+		case <-m.timerTime.C:
+			m.stopServer()
+		}
+	}
+}
+package main
+//这里是zk监控程序
+import (
+	"fmt"
+	"os"
+	"regexp"
+	"strings"
+	"time"
+	"zk"
+)
+
+func (m *MaHang) zkMonitor() {
+	log.Info("Start ZK monitor")
+	//local_ip := "172.16.8.120"
+	//ZK_URL := "172.16.8.120:11100"
+	zkURL := strings.Split(os.Getenv("ZOOKEEPER_URL"), ",")[0]
+	zkHost := []string{zkURL}
+	conn, _, err := zk.Connect(zkHost, 20*time.Second,zk.WithLogInfo(false))
+	defer conn.Close()
+	if err != nil {
+		v := fmt.Sprintf("ZK program connection failed,%v", err)
+		log.Error(v)
+	}
+	for  {
+		//childrenS是zk里服务列表，包含了不是本机的
+		childrenS, _, err := conn.Children("/vrv/im/service")
+		if err != nil {
+			v := fmt.Sprintf("Failed to get service list,%v", err)
+			log.Error(v)
+		}
+		localServerList := make(map[string]string, 70)
+		for i := 0; i < len(childrenS); i++ {
+			memServer := "/vrv/im/service/" + childrenS[i] + "/1.0"
+			memServerValue, _, _ := conn.Children(memServer)
+			memServerValueJoin := strings.Join(memServerValue, ",")
+			matchT, _ := regexp.Compile(*m.localIp + ":[0-9]+")
+			matchStr := matchT.FindString(memServerValueJoin)
+			if matchStr != "" {
+				nMatchStr := strings.Replace(matchStr, *m.localIp+":", "", -1)
+				localServerList[childrenS[i]] = nMatchStr
+			}
+		}
+		//将在线服务列表更新至全局
+		m.configServerList = localServerList
+	}
+}
+
+package main
+
+import (
+	"io/ioutil"
+	"yaml"
+)
+
+type Conf struct {
+	SysParameter	SysParameter
+	JavaServerList	JavaServerList
+}
+type SysParameter struct {
+	InterValTime	int
+	DeathNum	int
+}
+type JavaServerList struct {
+	SvList []string
+}
+
+func GetConf() Conf {
+	var conf Conf
+	yamlFile, err := ioutil.ReadFile("./config.yaml")
+	if err != nil {
+		log.Error("Failed to read configuration file")
+	}
+	err = yaml.Unmarshal(
+		yamlFile,
+		&conf,
+	)
+	if err != nil {
+		log.Error("Yaml format conversion failed")
+	}
+	return conf
+}
+sysparameter:
+  intervaltime: 60
+  deathnum: 2
+javaserverlist:
+  svlist: [analysiswebsiteServer, apnsAgentConfig, badWordServer, buddyServer, cacheServer, chatServer, cloudServer, collectionServer, commentCenterServer, customerServer, dbconfigServer, emoticonServer, enterpriseDictionaryService, enterpriseorganizationServer, enterpriseregisterServer, enterpriserolemenuServer, enterprisetaskServer, enterpriseuserServer, feedbackServer, fullSearchServer, groupDocServer, groupFileServer, groupMemberServer, groupServer, imageVerifyServer, iosNoticeServer, lbsServer, loginServer, messageStorageServer, netAdapterServer, newLoginService, onlineServer, operationLogServer, platformBusinessServer, platformDatabaseServer, platformServer, platformstatisticsServer, recommendServer, registerUserServer, settingServer, shareCommentServer, shareContentServer, statisticsServer, timeStampServer, uploadServer, userBaseServer, userServer, verifyCodeServer, verifyMessageServer, vrvxinServer]
+
